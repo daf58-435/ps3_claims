@@ -29,6 +29,9 @@ y = df["PurePremium"]
 # Create a reproducible training and testing sample split
 df = create_sample_split(df, id_column="IDpol", training_frac=0.8)
 
+# Create a reproducible training and testing sample split
+df = create_sample_split(df, id_column="IDpol", training_frac=0.8)
+
 train = np.where(df["sample"] == "train")[0]
 test = np.where(df["sample"] == "test")[0]
 df_train = df.iloc[train].copy()
@@ -301,5 +304,122 @@ ax.set(
 )
 ax.legend(loc="upper left")
 plt.plot()
+# %%
+# ============================================================
+# Problem Set 4
+# ============================================================
+# %%
+# Exercise 1: Monotonicity Constraints
+
+# Step 1: Calculate exposure-weighted average claims
+
+bonus_malus_avg = (
+    df.groupby("BonusMalus", as_index=False)
+    .agg(
+        total_claims=("ClaimAmountCut", "sum"),
+        total_exposure=("Exposure", "sum")
+    )
+)
+
+bonus_malus_avg["AverageClaims"] = (
+    bonus_malus_avg["total_claims"]
+    / bonus_malus_avg["total_exposure"]
+)
+
+print(bonus_malus_avg.head())
+
+# %%
+
+# Plot exposure-weighted average claims by BonusMalus
+
+fig, ax = plt.subplots(figsize=(10, 6))
+
+ax.plot(
+    bonus_malus_avg["BonusMalus"],
+    bonus_malus_avg["AverageClaims"],
+    marker="o"
+)
+
+ax.set(
+    title="Exposure-weighted Average Claims by BonusMalus",
+    xlabel="BonusMalus",
+    ylabel="Average Claims per Unit of Exposure"
+)
+
+plt.show()
+
+# %%
+# Examine groups with the smallest exposure
+
+print(
+    bonus_malus_avg
+    .sort_values("total_exposure")
+    .head(10)
+)
+# %%
+# What will/could happen if we do not include a monotonicity constraint?
+# Without a monotonicity constraint, LightGBM may produce non-monotonic predictions due to complex feature interactions and data noise. Consequently, a higher BonusMalus score could sometimes lead to a lower predicted premium, contradicting the expected relationship.
+
+# %%
+
+# Step 2: Create a constrained LightGBM
+
+print(X_train_t.columns.tolist())
+
+monotone_constraints = [
+    1 if col == "BonusMalus" else 0
+    for col in X_train_t.columns
+]
+
+print(monotone_constraints)
+
+constrained_lgbm = GridSearchCV(
+    estimator=LGBMRegressor(
+        objective="tweedie",
+        tweedie_variance_power=1.5,
+        monotone_constraints=monotone_constraints,
+    ),
+    param_grid=param_grid,
+    cv=5,
+    scoring=tweedie_scorer,
+    n_jobs=-1,
+)
+# %%
+# Fit the constrained LightGBM using 5-fold CV
+
+constrained_lgbm.fit(
+    X_train_t,
+    y_train_t,
+    sample_weight=w_train_t
+)
+
+print("Best parameters:", constrained_lgbm.best_params_)
+print("Best CV score:", constrained_lgbm.best_score_)
+print(constrained_lgbm.best_estimator_)
+# %%
+
+# Step 3: Predict using the best constrained estimator
+
+df_test["pp_t_lgbm_constrained"] = (
+    constrained_lgbm.best_estimator_.predict(X_test_t)
+)
+
+df_train["pp_t_lgbm_constrained"] = (
+    constrained_lgbm.best_estimator_.predict(X_train_t)
+)
+
+print(
+    df_test[
+        ["PurePremium", "pp_t_lgbm_constrained"]
+    ].head()
+)
+# %%
+# Compare the CV scores of the unconstrained and constrained models
+
+print("Unconstrained CV score:", cv.best_score_)
+print("Constrained CV score:", constrained_lgbm.best_score_)
+
+print("Unconstrained:", cv.best_params_)
+print("Constrained:", constrained_lgbm.best_params_)
 
 # %%
