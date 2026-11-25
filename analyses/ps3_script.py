@@ -182,6 +182,7 @@ print(
 model_pipeline = LGBMRegressor(
     objective="tweedie",
     tweedie_variance_power=1.5,
+    n_jobs=1,
 )
 model_pipeline.fit(X_train_t, y_train_t, sample_weight=w_train_t)
 df_test["pp_t_lgbm"] = model_pipeline.predict(X_test_t)
@@ -222,6 +223,7 @@ cv = GridSearchCV(
     estimator=LGBMRegressor(
         objective="tweedie",
         tweedie_variance_power=1.5,
+        n_jobs=1,
     ),
     param_grid=param_grid,
     cv=5,
@@ -377,6 +379,7 @@ constrained_lgbm = GridSearchCV(
     estimator=LGBMRegressor(
         objective="tweedie",
         tweedie_variance_power=1.5,
+        n_jobs=1,
         monotone_constraints=monotone_constraints,
     ),
     param_grid=param_grid,
@@ -423,3 +426,34 @@ print("Unconstrained:", cv.best_params_)
 print("Constrained:", constrained_lgbm.best_params_)
 
 # %%
+# Exercise 2 – Learning curve
+import lightgbm as lgb
+from sklearn.base import clone
+
+def cv_tweedie_metric(y_true, y_pred):
+    score = -TweedieDist.deviance(y_true, y_pred) / len(y_true)
+    return "neg_mean_tweedie_deviance", score, True  # Higher is better
+
+curve_model = clone(constrained_lgbm.best_estimator_)
+curve_model.fit(
+    X_train_t, y_train_t,
+    sample_weight=w_train_t,
+    eval_set=[(X_train_t, y_train_t), (X_test_t, y_test_t)],
+    eval_names=["train", "test"],
+    eval_sample_weight=[w_train_t, w_test_t],
+    eval_metric=cv_tweedie_metric,
+)
+
+lgb.plot_metric(
+    curve_model,
+    metric="neg_mean_tweedie_deviance",
+    title="Constrained LightGBM learning curve",
+    xlabel="Boosting iteration (0 = first tree)",
+    ylabel="Negative mean Tweedie deviance",
+)
+plt.show()
+# Both the training and test scores improve in the beginning. The test score
+# achieves the best using 38 trees, then declines while the training score
+# continues to improve. This suggests overfitting in later iterations, so we
+# should explore less thn 100 trees using cross validation.
+# # %%
