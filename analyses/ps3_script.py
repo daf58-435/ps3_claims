@@ -2,7 +2,6 @@
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from dask_ml.preprocessing import Categorizer
 from glum import GeneralizedLinearRegressor, TweedieDistribution
 from lightgbm import LGBMRegressor
 from sklearn.compose import ColumnTransformer
@@ -11,6 +10,7 @@ from sklearn.model_selection import GridSearchCV
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, SplineTransformer, StandardScaler
 
+from evaluation import evaluate_predictions
 from ps3.data import create_sample_split, load_transform
 
 # %%
@@ -42,12 +42,26 @@ df_test = df.iloc[test].copy()
 categoricals = ["VehBrand", "VehGas", "Region", "Area", "DrivAge", "VehAge", "VehPower"]
 
 predictors = categoricals + ["BonusMalus", "Density"]
-glm_categorizer = Categorizer(columns=categoricals)
+# Encode categories with scikit-learn and preserve column names for the
+# BonusMalus monotonicity constraint used by LightGBM below.
+feature_encoder = ColumnTransformer(
+    transformers=[
+        (
+            "cat",
+            OneHotEncoder(
+                drop="first", handle_unknown="ignore", sparse_output=False
+            ),
+            categoricals,
+        ),
+    ],
+    remainder="passthrough",
+    verbose_feature_names_out=False,
+).set_output(transform="pandas")
 
 #%%
 
-X_train_t = glm_categorizer.fit_transform(df[predictors].iloc[train])
-X_test_t = glm_categorizer.transform(df[predictors].iloc[test])
+X_train_t = feature_encoder.fit_transform(df[predictors].iloc[train])
+X_test_t = feature_encoder.transform(df[predictors].iloc[test])
 y_train_t, y_test_t = y.iloc[train], y.iloc[test]
 w_train_t, w_test_t = weight[train], weight[test]
 
@@ -456,4 +470,25 @@ plt.show()
 # achieves the best using 38 trees, then declines while the training score
 # continues to improve. This suggests overfitting in later iterations, so we
 # should explore less thn 100 trees using cross validation.
-# # %%
+# %%
+# Exercise 3: Evaluate constrained and unconstrained LightGBM models.
+# Each column uses the same held-out policies and exposure weights.
+
+lgbm_comparison = pd.concat(
+    {
+        "Unconstrained LGBM": evaluate_predictions(
+            df_test["pp_t_lgbm"], df_test["PurePremium"], df_test["Exposure"]
+        )["value"],
+        "Constrained LGBM": evaluate_predictions(
+            df_test["pp_t_lgbm_constrained"],
+            df_test["PurePremium"],
+            df_test["Exposure"],
+        )["value"],
+    },
+    axis=1,
+)
+print("Exposure-weighted test metrics (Gini follows the Lorenz plot):")
+print(lgbm_comparison)
+# Prefer bias close to zero, lower deviance/MAE/RMSE, and higher Gini.
+
+# %%
