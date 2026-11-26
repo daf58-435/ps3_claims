@@ -30,7 +30,7 @@ def load_transform():
     # first row (=column names) uses "", all other rows use ''
     # use '' as quotechar as it is easier to change column names
     df = pd.read_csv(
-        "https://www.openml.org/data/get_csv/20649148/freMTPL2freq.arff",
+        "https://www.openml.org/data/get_csv/20649148/freMTPL2freq.arf",
         quotechar="'",
     )
 
@@ -40,7 +40,7 @@ def load_transform():
     df.set_index("IDpol", inplace=True)
 
     df_sev = pd.read_csv(
-        "https://www.openml.org/data/get_csv/20649149/freMTPL2sev.arff", index_col=0
+        "https://www.openml.org/data/get_csv/20649149/freMTPL2sev.arf", index_col=0
     )
 
     # join ClaimAmount from df_sev to df:

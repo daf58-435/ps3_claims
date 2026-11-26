@@ -7,6 +7,8 @@ import numpy as np
 import pandas as pd
 from glum import GeneralizedLinearRegressor, TweedieDistribution
 from lightgbm import LGBMRegressor
+
+from sklearn.base import clone
 from sklearn.compose import ColumnTransformer
 from sklearn.model_selection import GridSearchCV
 from sklearn.pipeline import Pipeline
@@ -149,6 +151,9 @@ print("PS3: models ready.", flush=True)
 
 print(model_summary)
 
+#reminder - at this point, we have just built 3 models using our training data
+#and have now tested them on our test split.
+
 # %%
 # Compare risk ranking on the held-out policies
 fig, ax = plot_lorenz_curves(df_test)
@@ -212,7 +217,7 @@ monotone_constraints = [
 ]
 
 print(monotone_constraints)
-
+'''
 constrained_lgbm = GridSearchCV(
     estimator=LGBMRegressor(
         objective="tweedie",
@@ -227,6 +232,10 @@ constrained_lgbm = GridSearchCV(
     pre_dispatch=2,
     verbose=2,
     error_score="raise",
+)'''
+
+constrained_lgbm = clone(cv).set_params(
+    estimator__monotone_constraints = monotone_constraints
 )
 
 # %%
@@ -245,8 +254,6 @@ df_test["pp_t_lgbm_constrained"] = constrained_lgbm.best_estimator_.predict(X_te
 
 df_train["pp_t_lgbm_constrained"] = constrained_lgbm.best_estimator_.predict(X_train_t)
 
-print(df_test[["PurePremium", "pp_t_lgbm_constrained"]].head())
-
 # %%
 # Compare the CV scores of the unconstrained and constrained models
 
@@ -260,6 +267,12 @@ print("Constrained:", constrained_lgbm.best_params_)
 # Exercise 2 – Learning curve
 import lightgbm as lgb
 from sklearn.base import clone
+
+#the point of this section is that you want to determine whether you are overfitting your model
+#you take your best model (at this stage you have selected the best hyperparameters but not estimated the model)
+#you allow the lightgbm to build trees repeating to minimize loss
+#you see at what stage the hyperparameters that you chose based on your training set begin overfitting for 
+#for training set. 
 
 
 def cv_tweedie_metric(y_true, y_pred):
@@ -298,7 +311,9 @@ plt.show()
 lgbm_comparison = pd.concat(
     {
         "Unconstrained LGBM": evaluate_predictions(
-            df_test["pp_t_lgbm"], df_test["PurePremium"], df_test["Exposure"]
+            df_test["pp_t_lgbm"], 
+            df_test["PurePremium"], 
+            df_test["Exposure"]
         )["value"],
         "Constrained LGBM": evaluate_predictions(
             df_test["pp_t_lgbm_constrained"],
