@@ -1,63 +1,27 @@
 # %%
 
+from functools import partial
+
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from glum import GeneralizedLinearRegressor, TweedieDistribution
 from lightgbm import LGBMRegressor
 from sklearn.compose import ColumnTransformer
-from sklearn.metrics import auc
 from sklearn.model_selection import GridSearchCV
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, SplineTransformer, StandardScaler
 
 from evaluation import evaluate_predictions
 from ps3.data import create_sample_split, load_transform
+from tools import lorenz_curve, plot_lorenz_curves, tweedie_scorer
 
 TweedieDist = TweedieDistribution(1.5)
+tweedie_cv_scorer = partial(tweedie_scorer, distribution=TweedieDist)
 categoricals = ["VehBrand", "VehGas", "Region", "Area", "DrivAge", "VehAge", "VehPower"]
 numeric_cols = ["BonusMalus", "Density"]
 predictors = categoricals + numeric_cols
 param_grid = {"learning_rate": [0.05, 0.1], "n_estimators": [100, 200]}
-
-
-def tweedie_scorer(estimator, X, y):
-    """Use the same unweighted CV score for both LightGBM searches."""
-    return -TweedieDist.deviance(y, estimator.predict(X)) / len(y)
-
-
-# Source: scikit-learn's Tweedie regression insurance claims example.
-def lorenz_curve(y_true, y_pred, exposure):
-    """Return cumulative claims ordered by predicted risk."""
-    ranking = np.argsort(np.asarray(y_pred))
-    claims = np.asarray(y_true) * np.asarray(exposure)
-    cumulative_claims = np.cumsum(claims[ranking])
-    cumulative_claims /= cumulative_claims[-1]
-    return np.linspace(0, 1, len(claims)), cumulative_claims
-
-
-def plot_lorenz_curves(data):
-    """Compare the fitted models and oracle on the held-out policies."""
-    fig, ax = plt.subplots(figsize=(8, 8))
-    for label, column in [
-        ("LGBM", "pp_t_lgbm"),
-        ("GLM Benchmark", "pp_t_glm1"),
-        ("GLM Splines", "pp_t_glm2"),
-        ("Oracle", "PurePremium"),
-    ]:
-        x, claims = lorenz_curve(data["PurePremium"], data[column], data["Exposure"])
-        gini = 1 - 2 * auc(x, claims)
-        style = {"linestyle": "-.", "color": "gray"} if label == "Oracle" else {}
-        ax.plot(x, claims, label=f"{label} (Gini index: {gini:.3f})", **style)
-    ax.plot([0, 1], [0, 1], "--", color="black", label="Random baseline")
-    ax.set(
-        title="Lorenz Curves",
-        xlabel="Fraction of policyholders\n(ordered from safest to riskiest)",
-        ylabel="Fraction of total claim amount",
-    )
-    ax.legend(loc="upper left")
-    return fig, ax
-
 
 # %%
 # Load data and create the train/test split
@@ -139,7 +103,7 @@ cv = GridSearchCV(
     ),
     param_grid=param_grid,
     cv=5,
-    scoring=tweedie_scorer,
+    scoring=tweedie_cv_scorer,
     n_jobs=2,
     verbose=2,
     pre_dispatch=2,
@@ -258,7 +222,7 @@ constrained_lgbm = GridSearchCV(
     ),
     param_grid=param_grid,
     cv=5,
-    scoring=tweedie_scorer,
+    scoring=tweedie_cv_scorer,
     n_jobs=2,
     pre_dispatch=2,
     verbose=2,
@@ -347,3 +311,84 @@ lgbm_comparison = pd.concat(
 print("Exposure-weighted test metrics (Gini follows the Lorenz plot):")
 print(lgbm_comparison)
 # Prefer bias close to zero, lower deviance/MAE/RMSE, and higher Gini.
+
+# %%
+# Exercise 4: Explain the fitted LightGBM models on the held-out policies.
+
+import dalex as dx
+
+explainer_constrained = dx.Explainer(
+    model=constrained_lgbm.best_estimator_,
+    data=X_test_t,
+    y=y_test_t,
+    weights=w_test_t,
+    label="Constrained LGBM",
+)
+
+explainer_unconstrained = dx.Explainer(
+    model=lgbm,
+    data=X_test_t,
+    y=y_test_t,
+    weights=w_test_t,
+    label="Unconstrained LGBM",
+)
+
+pdp_constrained = explainer_constrained.model_profile(
+    type="partial",
+    variable_type="numerical",
+    N=300,
+    random_state=42,
+)
+
+pdp_unconstrained = explainer_unconstrained.model_profile(
+    type="partial",
+    variable_type="numerical",
+    N=300,
+    random_state=42,
+)
+# %%
+pdp_constrained.plot(pdp_unconstrained)
+
+# %%
+# Exercise 5: Compare SHAP explanations for constrained LightGBM and benchmark GLM.
+
+# Reuse explainer_constrained from Exercise 4.
+explainer_glm = dx.Explainer(
+    model=t_glm1,
+    data=X_test_t,
+    y=y_test_t,
+    weights=w_test_t,
+    model_type="regression",
+    label="GLM Benchmark",
+)
+
+# Select the first observation from the test set
+observation = X_test_t.iloc[[0]]
+
+# Calculate SHAP values for constrained LGBM
+shap_constrained = explainer_constrained.predict_parts(
+    new_observation=observation,
+    type="shap",
+    B=25,
+    random_state=42,
+)
+
+# Calculate SHAP values for GLM
+shap_glm = explainer_glm.predict_parts(
+    new_observation=observation,
+    type="shap",
+    B=25,
+    random_state=42,
+)
+
+# Plot and compare both decompositions
+shap_constrained.plot(shap_glm, max_vars=X_test_t.shape[1])
+
+# Compare predictions and baseline values
+print("GLM prediction:", shap_glm.prediction)
+print("GLM baseline:", shap_glm.intercept)
+
+print("LGBM prediction:", shap_constrained.prediction)
+print("LGBM baseline:", shap_constrained.intercept)
+
+# %%

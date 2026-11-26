@@ -5,6 +5,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import pytest
+from plotly.basedatatypes import BaseFigure
 from sklearn.metrics import mean_tweedie_deviance
 from sklearn.model_selection import GridSearchCV
 
@@ -53,6 +54,7 @@ def test_combined_analysis_runs_through_ps3_and_ps4(monkeypatch):
     monkeypatch.setattr(plt, "subplots", subplots)
     show = Mock()
     monkeypatch.setattr(plt, "show", show)
+    monkeypatch.setattr(BaseFigure, "show", Mock())
     try:
         results = runpy.run_module("analyses.ps3_script", run_name="__main__")
     finally:
@@ -96,6 +98,27 @@ def test_combined_analysis_runs_through_ps3_and_ps4(monkeypatch):
     ] == 1
     assert sum(results["monotone_constraints"]) == 1
     assert set(results["curve_model"].evals_result_) == {"train", "test"}
+    for name, column in [
+        ("explainer_constrained", "pp_t_lgbm_constrained"),
+        ("explainer_unconstrained", "pp_t_lgbm"),
+    ]:
+        explainer = results[name]
+        np.testing.assert_allclose(
+            explainer.predict(results["X_test_t"]), results["df_test"][column]
+        )
+        np.testing.assert_allclose(explainer.y, results["y_test_t"])
+        np.testing.assert_allclose(explainer.weights, results["w_test_t"])
+    for name, column in [
+        ("shap_constrained", "pp_t_lgbm_constrained"),
+        ("shap_glm", "pp_t_glm1"),
+    ]:
+        explanation = results[name]
+        assert explanation.prediction == pytest.approx(
+            results["df_test"][column].iloc[0]
+        )
+        assert explanation.intercept == pytest.approx(
+            results["df_test"][column].mean()
+        )
     comparison = results["lgbm_comparison"]
     assert comparison.shape == (5, 2)
     assert np.isfinite(comparison.to_numpy()).all()
