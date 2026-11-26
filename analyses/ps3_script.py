@@ -1,4 +1,5 @@
 # %%
+
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -13,339 +14,200 @@ from sklearn.preprocessing import OneHotEncoder, SplineTransformer, StandardScal
 from evaluation import evaluate_predictions
 from ps3.data import create_sample_split, load_transform
 
+TweedieDist = TweedieDistribution(1.5)
+categoricals = ["VehBrand", "VehGas", "Region", "Area", "DrivAge", "VehAge", "VehPower"]
+numeric_cols = ["BonusMalus", "Density"]
+predictors = categoricals + numeric_cols
+param_grid = {"learning_rate": [0.05, 0.1], "n_estimators": [100, 200]}
+
+
+def tweedie_scorer(estimator, X, y):
+    """Use the same unweighted CV score for both LightGBM searches."""
+    return -TweedieDist.deviance(y, estimator.predict(X)) / len(y)
+
+
+# Source: scikit-learn's Tweedie regression insurance claims example.
+def lorenz_curve(y_true, y_pred, exposure):
+    """Return cumulative claims ordered by predicted risk."""
+    ranking = np.argsort(np.asarray(y_pred))
+    claims = np.asarray(y_true) * np.asarray(exposure)
+    cumulative_claims = np.cumsum(claims[ranking])
+    cumulative_claims /= cumulative_claims[-1]
+    return np.linspace(0, 1, len(claims)), cumulative_claims
+
+
+def plot_lorenz_curves(data):
+    """Compare the fitted models and oracle on the held-out policies."""
+    fig, ax = plt.subplots(figsize=(8, 8))
+    for label, column in [
+        ("LGBM", "pp_t_lgbm"),
+        ("GLM Benchmark", "pp_t_glm1"),
+        ("GLM Splines", "pp_t_glm2"),
+        ("Oracle", "PurePremium"),
+    ]:
+        x, claims = lorenz_curve(data["PurePremium"], data[column], data["Exposure"])
+        gini = 1 - 2 * auc(x, claims)
+        style = {"linestyle": "-.", "color": "gray"} if label == "Oracle" else {}
+        ax.plot(x, claims, label=f"{label} (Gini index: {gini:.3f})", **style)
+    ax.plot([0, 1], [0, 1], "--", color="black", label="Random baseline")
+    ax.set(
+        title="Lorenz Curves",
+        xlabel="Fraction of policyholders\n(ordered from safest to riskiest)",
+        ylabel="Fraction of total claim amount",
+    )
+    ax.legend(loc="upper left")
+    return fig, ax
+
+
 # %%
-# load data
+# Load data and create the train/test split
+print("PS3: loading OpenML data...", flush=True)
 df = load_transform()
 
-# %%
-# Train benchmark tweedie model. This is entirely based on the glum tutorial.
-weight = df["Exposure"].values
 df["PurePremium"] = df["ClaimAmountCut"] / df["Exposure"]
+df = create_sample_split(df, id_column="IDpol", training_frac=0.8)
+train = np.flatnonzero(df["sample"] == "train")
+test = np.flatnonzero(df["sample"] == "test")
+df_train, df_test = df.iloc[train].copy(), df.iloc[test].copy()
 y = df["PurePremium"]
-# Why do you think, we divide by exposure here to arrive at our outcome variable?
-# We divide ClaimAmountCut by Exposure to obtain PurePremium, which represents the expected claim amount per unit of exposure. Exposure is also used as a sample weight when fitting the model, so observations with greater exposure contribute more to the estimation.
+weight = df["Exposure"].to_numpy()
+y_train_t, y_test_t = y.iloc[train], y.iloc[test]
+w_train_t, w_test_t = weight[train], weight[test]
 
-#%%
-# Create a reproducible training and testing sample split
-df = create_sample_split(df, id_column="IDpol", training_frac=0.8)
-
-# Create a reproducible training and testing sample split
-df = create_sample_split(df, id_column="IDpol", training_frac=0.8)
-
-train = np.where(df["sample"] == "train")[0]
-test = np.where(df["sample"] == "test")[0]
-df_train = df.iloc[train].copy()
-df_test = df.iloc[test].copy()
-
-#%%
-
-categoricals = ["VehBrand", "VehGas", "Region", "Area", "DrivAge", "VehAge", "VehPower"]
-
-predictors = categoricals + ["BonusMalus", "Density"]
-# Encode categories with scikit-learn and preserve column names for the
-# BonusMalus monotonicity constraint used by LightGBM below.
+# %%
+# Encode predictors for the benchmark GLM and LightGBM
 feature_encoder = ColumnTransformer(
-    transformers=[
+    [
         (
             "cat",
-            OneHotEncoder(
-                drop="first", handle_unknown="ignore", sparse_output=False
-            ),
+            OneHotEncoder(drop="first", handle_unknown="ignore", sparse_output=False),
             categoricals,
         ),
     ],
     remainder="passthrough",
     verbose_feature_names_out=False,
 ).set_output(transform="pandas")
+X_train_t = feature_encoder.fit_transform(df_train[predictors])
+X_test_t = feature_encoder.transform(df_test[predictors])
 
-#%%
-
-X_train_t = feature_encoder.fit_transform(df[predictors].iloc[train])
-X_test_t = feature_encoder.transform(df[predictors].iloc[test])
-y_train_t, y_test_t = y.iloc[train], y.iloc[test]
-w_train_t, w_test_t = weight[train], weight[test]
-
-TweedieDist = TweedieDistribution(1.5)
+# %%
+# Fit the benchmark GLM
+print("PS3: fitting benchmark and spline GLMs...", flush=True)
 t_glm1 = GeneralizedLinearRegressor(family=TweedieDist, l1_ratio=1, fit_intercept=True)
+
 t_glm1.fit(X_train_t, y_train_t, sample_weight=w_train_t)
 
-#%%
-
-pd.DataFrame(
-    {"coefficient": np.concatenate(([t_glm1.intercept_], t_glm1.coef_))},
-    index=["intercept"] + t_glm1.feature_names_,
-).T
-
-df_test["pp_t_glm1"] = t_glm1.predict(X_test_t)
-df_train["pp_t_glm1"] = t_glm1.predict(X_train_t)
-
-#%%
-
-print(
-    "training loss t_glm1:  {}".format(
-        TweedieDist.deviance(y_train_t, df_train["pp_t_glm1"], sample_weight=w_train_t)
-        / np.sum(w_train_t)
-    )
-)
-
-print(
-    "testing loss t_glm1:  {}".format(
-        TweedieDist.deviance(y_test_t, df_test["pp_t_glm1"], sample_weight=w_test_t)
-        / np.sum(w_test_t)
-    )
-)
-
-print(
-    "Total claim amount on test set, observed = {}, predicted = {}".format(
-        df["ClaimAmountCut"].values[test].sum(),
-        np.sum(df["Exposure"].values[test] * t_glm1.predict(X_test_t)),
-    )
-)
 # %%
-# TODO: Let's add splines for BonusMalus and Density and use a Pipeline.
-# Steps: 
-# 1. Define a Pipeline which chains a StandardScaler and SplineTransformer. 
-#    Choose knots="quantile" for the SplineTransformer and make sure, we 
-#    are only including one intercept in the final GLM. 
-# 2. Put the transforms together into a ColumnTransformer. Here we use OneHotEncoder for the categoricals.
-# 3. Chain the transforms together with the GLM in a Pipeline.
-
-# Let's put together a pipeline
-numeric_cols = ["BonusMalus", "Density"]
-numeric_transformer = Pipeline(
-    steps=[
-        ("scaler", StandardScaler()),
+# Fit the spline GLM
+preprocessor = ColumnTransformer(
+    [
         (
-            "spline",
-            SplineTransformer(
-                knots="quantile",
-                include_bias=False,
+            "num",
+            Pipeline(
+                [
+                    ("scaler", StandardScaler()),
+                    ("spline", SplineTransformer(knots="quantile", include_bias=False)),
+                ]
             ),
+            numeric_cols,
+        ),
+        (
+            "cat",
+            OneHotEncoder(drop="first", handle_unknown="ignore", sparse_output=False),
+            categoricals,
         ),
     ]
-)
-preprocessor = ColumnTransformer(
-    transformers=[
-        ("num", numeric_transformer, numeric_cols),
-        ("cat", OneHotEncoder(sparse_output=False, drop="first"), categoricals),
-    ]
-)
-preprocessor.set_output(transform="pandas")
-
-model_pipeline = Pipeline(
-    steps=[
+).set_output(transform="pandas")
+spline_glm = Pipeline(
+    [
         ("preprocessor", preprocessor),
         (
             "estimate",
-            GeneralizedLinearRegressor(
-                family=TweedieDist,
-                l1_ratio=1,
-                fit_intercept=True,
-            ),
+            GeneralizedLinearRegressor(family=TweedieDist, l1_ratio=1, fit_intercept=True),
         ),
     ]
 )
 
-# let's have a look at the pipeline
-model_pipeline
-
-# let's check that the transforms worked
-model_pipeline[:-1].fit_transform(df_train)
-
-model_pipeline.fit(df_train, y_train_t, estimate__sample_weight=w_train_t)
-
-pd.DataFrame(
-    {
-        "coefficient": np.concatenate(
-            ([model_pipeline[-1].intercept_], model_pipeline[-1].coef_)
-        )
-    },
-    index=["intercept"] + model_pipeline[-1].feature_names_,
-).T
-
-df_test["pp_t_glm2"] = model_pipeline.predict(df_test)
-df_train["pp_t_glm2"] = model_pipeline.predict(df_train)
-
-print(
-    "training loss t_glm2:  {}".format(
-        TweedieDist.deviance(y_train_t, df_train["pp_t_glm2"], sample_weight=w_train_t)
-        / np.sum(w_train_t)
-    )
-)
-
-print(
-    "testing loss t_glm2:  {}".format(
-        TweedieDist.deviance(y_test_t, df_test["pp_t_glm2"], sample_weight=w_test_t)
-        / np.sum(w_test_t)
-    )
-)
-
-print(
-    "Total claim amount on test set, observed = {}, predicted = {}".format(
-        df["ClaimAmountCut"].values[test].sum(),
-        np.sum(df["Exposure"].values[test] * df_test["pp_t_glm2"]),
-    )
-)
+spline_glm.fit(df_train[predictors], y_train_t, estimate__sample_weight=w_train_t)
 
 # %%
-# TODO: Let's use a GBM instead as an estimator.
-# Steps
-# 1: Define the modelling pipeline. Tip: This can simply be a LGBMRegressor based on X_train_t from before.
-# 2. Make sure we are choosing the correct objective for our estimator.
-
-model_pipeline = LGBMRegressor(
-    objective="tweedie",
-    tweedie_variance_power=1.5,
-    n_jobs=1,
-)
-model_pipeline.fit(X_train_t, y_train_t, sample_weight=w_train_t)
-df_test["pp_t_lgbm"] = model_pipeline.predict(X_test_t)
-df_train["pp_t_lgbm"] = model_pipeline.predict(X_train_t)
-print(
-    "training loss t_lgbm:  {}".format(
-        TweedieDist.deviance(y_train_t, df_train["pp_t_lgbm"], sample_weight=w_train_t)
-        / np.sum(w_train_t)
-    )
-)
-
-print(
-    "testing loss t_lgbm:  {}".format(
-        TweedieDist.deviance(y_test_t, df_test["pp_t_lgbm"], sample_weight=w_test_t)
-        / np.sum(w_test_t)
-    )
-)
-
-# %%
-# TODO: Let's tune the LGBM to reduce overfitting.
-# Steps:
-# 1. Define a `GridSearchCV` object with our lgbm pipeline/estimator. Tip: Parameters for a specific step of the pipeline
-# can be passed by <step_name>__param. 
-
-# Note: Typically we tune many more parameters and larger grids,
-# but to save compute time here, we focus on getting the learning rate
-# and the number of estimators somewhat aligned -> tune learning_rate and n_estimators
-def tweedie_scorer(estimator, X, y):
-    y_pred = estimator.predict(X)
-    return -TweedieDist.deviance(y, y_pred) / len(y)
-
-param_grid = {
-    "learning_rate": [0.05, 0.1],
-    "n_estimators": [100, 200],
-}
-
+# Tune the unconstrained LightGBM
+print("PS3: tuning LightGBM (4 candidates, 5 folds, then refit)...", flush=True)
 cv = GridSearchCV(
-    estimator=LGBMRegressor(
-        objective="tweedie",
-        tweedie_variance_power=1.5,
-        n_jobs=1,
+    LGBMRegressor(
+        objective="tweedie", tweedie_variance_power=1.5, n_jobs=1, verbosity=-1
     ),
     param_grid=param_grid,
     cv=5,
     scoring=tweedie_scorer,
-    n_jobs=-1,
+    n_jobs=2,
+    verbose=2,
+    pre_dispatch=2,
+    error_score="raise",
 )
 
 cv.fit(X_train_t, y_train_t, sample_weight=w_train_t)
+lgbm = cv.best_estimator_
 
-df_test["pp_t_lgbm"] = cv.best_estimator_.predict(X_test_t)
-df_train["pp_t_lgbm"] = cv.best_estimator_.predict(X_train_t)
-
-print(
-    "training loss t_lgbm:  {}".format(
-        TweedieDist.deviance(y_train_t, df_train["pp_t_lgbm"], sample_weight=w_train_t)
-        / np.sum(w_train_t)
-    )
-)
-
-print(
-    "testing loss t_lgbm:  {}".format(
-        TweedieDist.deviance(y_test_t, df_test["pp_t_lgbm"], sample_weight=w_test_t)
-        / np.sum(w_test_t)
-    )
-)
-
-print(
-    "Total claim amount on test set, observed = {}, predicted = {}".format(
-        df["ClaimAmountCut"].values[test].sum(),
-        np.sum(df["Exposure"].values[test] * df_test["pp_t_lgbm"]),
-    )
-)
 # %%
-# Let's compare the sorting of the pure premium predictions
+# Compare fitted models on the train and test samples
+models = {
+    "LGBM": (lgbm, X_train_t, X_test_t, "pp_t_lgbm"),
+    "GLM Benchmark": (t_glm1, X_train_t, X_test_t, "pp_t_glm1"),
+    "GLM Splines": (
+        spline_glm, df_train[predictors], df_test[predictors], "pp_t_glm2"
+    ),
+}
+summary_rows = []
 
+for model_name, (estimator, X_train, X_test, column) in models.items():
+    for sample, data, X, actuals, exposure in [
+        ("train", df_train, X_train, y_train_t, w_train_t),
+        ("test", df_test, X_test, y_test_t, w_test_t),
+    ]:
+        predictions = estimator.predict(X)
+        data[column] = predictions
+        summary_rows.append(
+            {
+                "model": model_name,
+                "sample": sample,
+                "deviance": (
+                    TweedieDist.deviance(actuals, predictions, sample_weight=exposure)
+                    / exposure.sum()
+                ),
+                "actual_claims": np.sum(actuals * exposure),
+                "predicted_claims": np.sum(predictions * exposure),
+            }
+        )
+model_summary = pd.DataFrame(summary_rows).set_index(["model", "sample"])
 
-# Source: https://scikit-learn.org/stable/auto_examples/linear_model/plot_tweedie_regression_insurance_claims.html
-def lorenz_curve(y_true, y_pred, exposure):
-    y_true, y_pred = np.asarray(y_true), np.asarray(y_pred)
-    exposure = np.asarray(exposure)
+print("PS3: models ready.", flush=True)
 
-    # order samples by increasing predicted risk:
-    ranking = np.argsort(y_pred)
-    ranked_exposure = exposure[ranking]
-    ranked_pure_premium = y_true[ranking]
-    cumulated_claim_amount = np.cumsum(ranked_pure_premium * ranked_exposure)
-    cumulated_claim_amount /= cumulated_claim_amount[-1]
-    cumulated_samples = np.linspace(0, 1, len(cumulated_claim_amount))
-    return cumulated_samples, cumulated_claim_amount
+print(model_summary)
 
-
-fig, ax = plt.subplots(figsize=(8, 8))
-
-for label, y_pred in [
-    ("LGBM", df_test["pp_t_lgbm"]),
-    ("GLM Benchmark", df_test["pp_t_glm1"]),
-    ("GLM Splines", df_test["pp_t_glm2"]),
-]:
-    ordered_samples, cum_claims = lorenz_curve(
-        df_test["PurePremium"], y_pred, df_test["Exposure"]
-    )
-    gini = 1 - 2 * auc(ordered_samples, cum_claims)
-    label += f" (Gini index: {gini: .3f})"
-    ax.plot(ordered_samples, cum_claims, linestyle="-", label=label)
-
-# Oracle model: y_pred == y_test
-ordered_samples, cum_claims = lorenz_curve(
-    df_test["PurePremium"], df_test["PurePremium"], df_test["Exposure"]
-)
-gini = 1 - 2 * auc(ordered_samples, cum_claims)
-label = f"Oracle (Gini index: {gini: .3f})"
-ax.plot(ordered_samples, cum_claims, linestyle="-.", color="gray", label=label)
-
-# Random baseline
-ax.plot([0, 1], [0, 1], linestyle="--", color="black", label="Random baseline")
-ax.set(
-    title="Lorenz Curves",
-    xlabel="Fraction of policyholders\n(ordered by model from safest to riskiest)",
-    ylabel="Fraction of total claim amount",
-)
-ax.legend(loc="upper left")
-plt.plot()
 # %%
-# ============================================================
+# Compare risk ranking on the held-out policies
+fig, ax = plot_lorenz_curves(df_test)
+plt.show()
+
+# %%
 # Problem Set 4
-# ============================================================
-# %%
 # Exercise 1: Monotonicity Constraints
 
 # Step 1: Calculate exposure-weighted average claims
 
-bonus_malus_avg = (
-    df.groupby("BonusMalus", as_index=False)
-    .agg(
-        total_claims=("ClaimAmountCut", "sum"),
-        total_exposure=("Exposure", "sum")
-    )
+bonus_malus_avg = df.groupby("BonusMalus", as_index=False).agg(
+    total_claims=("ClaimAmountCut", "sum"),
+    total_exposure=("Exposure", "sum"),
 )
 
 bonus_malus_avg["AverageClaims"] = (
-    bonus_malus_avg["total_claims"]
-    / bonus_malus_avg["total_exposure"]
+    bonus_malus_avg["total_claims"] / bonus_malus_avg["total_exposure"]
 )
 
 print(bonus_malus_avg.head())
 
 # %%
-
 # Plot exposure-weighted average claims by BonusMalus
 
 fig, ax = plt.subplots(figsize=(10, 6))
@@ -353,13 +215,13 @@ fig, ax = plt.subplots(figsize=(10, 6))
 ax.plot(
     bonus_malus_avg["BonusMalus"],
     bonus_malus_avg["AverageClaims"],
-    marker="o"
+    marker="o",
 )
 
 ax.set(
     title="Exposure-weighted Average Claims by BonusMalus",
     xlabel="BonusMalus",
-    ylabel="Average Claims per Unit of Exposure"
+    ylabel="Average Claims per Unit of Exposure",
 )
 
 plt.show()
@@ -367,24 +229,22 @@ plt.show()
 # %%
 # Examine groups with the smallest exposure
 
-print(
-    bonus_malus_avg
-    .sort_values("total_exposure")
-    .head(10)
-)
+print(bonus_malus_avg.sort_values("total_exposure").head(10))
+
 # %%
 # What will/could happen if we do not include a monotonicity constraint?
-# Without a monotonicity constraint, LightGBM may produce non-monotonic predictions due to complex feature interactions and data noise. Consequently, a higher BonusMalus score could sometimes lead to a lower predicted premium, contradicting the expected relationship.
+# Without a monotonicity constraint, LightGBM may produce non-monotonic
+# predictions due to complex feature interactions and data noise. Consequently,
+# a higher BonusMalus score could sometimes lead to a lower predicted premium,
+# contradicting the expected relationship.
 
 # %%
-
 # Step 2: Create a constrained LightGBM
 
 print(X_train_t.columns.tolist())
 
 monotone_constraints = [
-    1 if col == "BonusMalus" else 0
-    for col in X_train_t.columns
+    1 if col == "BonusMalus" else 0 for col in X_train_t.columns
 ]
 
 print(monotone_constraints)
@@ -399,37 +259,30 @@ constrained_lgbm = GridSearchCV(
     param_grid=param_grid,
     cv=5,
     scoring=tweedie_scorer,
-    n_jobs=-1,
+    n_jobs=2,
+    pre_dispatch=2,
+    verbose=2,
+    error_score="raise",
 )
+
 # %%
 # Fit the constrained LightGBM using 5-fold CV
 
-constrained_lgbm.fit(
-    X_train_t,
-    y_train_t,
-    sample_weight=w_train_t
-)
+constrained_lgbm.fit(X_train_t, y_train_t, sample_weight=w_train_t)
 
 print("Best parameters:", constrained_lgbm.best_params_)
 print("Best CV score:", constrained_lgbm.best_score_)
 print(constrained_lgbm.best_estimator_)
-# %%
 
+# %%
 # Step 3: Predict using the best constrained estimator
 
-df_test["pp_t_lgbm_constrained"] = (
-    constrained_lgbm.best_estimator_.predict(X_test_t)
-)
+df_test["pp_t_lgbm_constrained"] = constrained_lgbm.best_estimator_.predict(X_test_t)
 
-df_train["pp_t_lgbm_constrained"] = (
-    constrained_lgbm.best_estimator_.predict(X_train_t)
-)
+df_train["pp_t_lgbm_constrained"] = constrained_lgbm.best_estimator_.predict(X_train_t)
 
-print(
-    df_test[
-        ["PurePremium", "pp_t_lgbm_constrained"]
-    ].head()
-)
+print(df_test[["PurePremium", "pp_t_lgbm_constrained"]].head())
+
 # %%
 # Compare the CV scores of the unconstrained and constrained models
 
@@ -444,13 +297,16 @@ print("Constrained:", constrained_lgbm.best_params_)
 import lightgbm as lgb
 from sklearn.base import clone
 
+
 def cv_tweedie_metric(y_true, y_pred):
     score = -TweedieDist.deviance(y_true, y_pred) / len(y_true)
     return "neg_mean_tweedie_deviance", score, True  # Higher is better
 
+
 curve_model = clone(constrained_lgbm.best_estimator_)
 curve_model.fit(
-    X_train_t, y_train_t,
+    X_train_t,
+    y_train_t,
     sample_weight=w_train_t,
     eval_set=[(X_train_t, y_train_t), (X_test_t, y_test_t)],
     eval_names=["train", "test"],
@@ -469,7 +325,8 @@ plt.show()
 # Both the training and test scores improve in the beginning. The test score
 # achieves the best using 38 trees, then declines while the training score
 # continues to improve. This suggests overfitting in later iterations, so we
-# should explore less thn 100 trees using cross validation.
+# should explore fewer than 100 trees using cross-validation.
+
 # %%
 # Exercise 3: Evaluate constrained and unconstrained LightGBM models.
 # Each column uses the same held-out policies and exposure weights.
@@ -490,5 +347,3 @@ lgbm_comparison = pd.concat(
 print("Exposure-weighted test metrics (Gini follows the Lorenz plot):")
 print(lgbm_comparison)
 # Prefer bias close to zero, lower deviance/MAE/RMSE, and higher Gini.
-
-# %%
